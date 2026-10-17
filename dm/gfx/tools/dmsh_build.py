@@ -32,6 +32,7 @@ IOSOUT = os.environ.get('IOSOUT')   # 设了就同时出 iOS 版（iphoneos meta
 if IOSOUT:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import metal_tool
 MAIN = os.environ.get('MAIN', f'{DM_ROOT}/data/switch/3.3.94012/Update/ExeFS/main')
 MAP = str(GAME.table('shader_map.tsv'))
 BF_WANT_FILE = str(GAME.table('bf_want.tsv'))
@@ -40,7 +41,7 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
 PRE_STATS = collections.Counter()
-MAC_RECORD = 'xcrun -sdk macosx metal -c; xcrun -sdk macosx metallib'
+MAC_RECORD = metal_tool.record('macosx')
 # 贴图句柄表（贴图指令立即数句柄所在的驱动段）：马力欧（NVN 55）是 0x20 + 8 r、32 槽——全库 4888 个着色器的立即数句柄恰是 0x20..0xF0、步长 8（D2R 的旧驱动是 0x168）。
 #   本作只用合并句柄（nvnCommandBufferBindTexture），没有分离采样器；图像句柄表仍在 0x120 + 8 r（8 槽，紧接贴图表之后；agl 的 10 个计算着色器实测 0x120 / 0x128 / 0x130，与 D2R 同址）。
 # Texture handle table (the driver segment holding texture instructions' immediate handles): Mario (NVN 55) uses 0x20 + 8 r, 32 slots - the immediate handles of all 4888 shaders are exactly 0x20..0xF0 in steps of 8 (D2R's older driver used 0x168).
@@ -156,6 +157,7 @@ def publish_cache(key, digest, rule_fp, code_fp):
     atomic_json(cache_meta_path(key), {'digest': digest, 'rule_fp': rule_fp, 'code_fp': code_fp})
 
 BF_STATS = collections.Counter()
+PENDING_VARIANTS = {}   # key → (msl, digest, fmeta)：等待批量编译 | waiting for the batched compile
 
 def bf_digest(msl, key):
     h = hashlib.sha256()
@@ -190,7 +192,9 @@ def write_refl(key, refl):
         atomic_json(os.path.join(d, key + '_b.json'), value)
 
 def fetch_finish(key, src, refl):
-    if refl['stage'] != 'ps': return refl
+    """生成可读 tile 变体的 MSL，**不编译**：编译由 compile_variants 批量做（见主循环）。
+    Returns the variant MSL to compile, or None. Compilation happens in compile_variants so one Windows crossing covers the whole batch."""
+    if refl['stage'] != 'ps': return None
     # 有可改采样的照旧出变体；没有可改采样的只给名单（bf_want.tsv，宿主规划器产出）里的键出仅输出映射变体
     # Those with rewritable samples get variants as before; those without get an output-mapping-only variant, and only for keys in the list (bf_want.tsv, produced by the host planner)
     fv, fmeta = dmsh_fetch.variant(src, refl['bindings'], om_only_ok=key in BF_WANT)
@@ -198,39 +202,36 @@ def fetch_finish(key, src, refl):
         for path in (os.path.join(out, key + '_bf.metallib'), os.path.join(out, key + '_bf.metal')) + ((os.path.join(IOSOUT, key + '_bf.metallib'),) if IOSOUT else ()):
             try: os.unlink(path)
             except FileNotFoundError: pass
-        write_refl(key, refl)
-        return refl
+        return None
     BF_STATS['generated'] += 1
     fmsl = os.path.join(out, key + '_bf.metal')
     digest = bf_digest(fv, key)
     with CAS_LOCKS_GUARD: lock = CAS_LOCKS.setdefault(('variant', digest), threading.Lock())
     with lock:
-        try:
-            if not bf_cache_restore(key, digest, fmeta, fmsl):
-                BF_STATS['miss'] += 1
-                open(fmsl, 'w').write(fv)
-                fair = fmsl[:-6] + '.air'; flib = os.path.join(out, key + '_bf.metallib')
-                try:
-                    subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', fmsl, '-o', fair], check=True)
-                    tmp_flib = flib + '.tmp-' + str(os.getpid())
-                    subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', fair, '-o', tmp_flib], check=True)
-                    os.replace(tmp_flib, flib)
-                    ilib = None
-                    if IOSOUT:
-                        ilib = os.path.join(IOSOUT, key + '_bf.metallib')
-                        ios_metal.compile(fmsl, fmsl[:-6] + '.ios.air', ilib + '.tmp')
-                        os.replace(ilib + '.tmp', ilib)
-                except subprocess.CalledProcessError:
-                    return refl
-                BF_STATS['compile'] += 1
-                bf_cache_publish(digest, fmsl, flib, ilib, fmeta)
-        finally:
-            for path in (fmsl, fmsl[:-6] + '.air', fmsl[:-6] + '.ios.air'):
-                try: os.unlink(path)
-                except FileNotFoundError: pass
-    refl['fetch'] = fmeta
-    write_refl(key, refl)
-    return refl
+        if bf_cache_restore(key, digest, fmeta, fmsl): return None
+        BF_STATS['miss'] += 1
+        open(fmsl, 'w').write(fv)
+        PENDING_VARIANTS[key] = (fmsl, digest, fmeta)
+        return fmsl
+
+def compile_variants():
+    """批量编译待编的可读 tile 变体（mac + iOS 各一次跨越）。"""
+    if not PENDING_VARIANTS: return
+    items = [(k, fmsl, os.path.join(out, k + '_bf.metallib')) for k, (fmsl, _, _) in PENDING_VARIANTS.items()]
+    errs = compile_pending(items)
+    if IOSOUT:
+        ierrs = metal_tool.compile_batch([(fmsl, os.path.join(IOSOUT, k + '_bf.metallib')) for k, (fmsl, _, _) in PENDING_VARIANTS.items()], 'iphoneos', ios_metal.FLAGS)
+    else:
+        ierrs = [None] * len(items)
+    for (k, _, _), (fmsl, digest, fmeta), e, ie in zip(items, PENDING_VARIANTS.values(), errs, ierrs):
+        if e or ie:
+            BF_STATS['failed'] += 1; continue
+        BF_STATS['compile'] += 1
+        bf_cache_publish(digest, fmsl, os.path.join(out, k + '_bf.metallib'), os.path.join(IOSOUT, k + '_bf.metallib') if IOSOUT else None, fmeta)
+        for path in (fmsl, os.path.splitext(fmsl)[0] + '.air'):
+            try: os.unlink(path)
+            except FileNotFoundError: pass
+    PENDING_VARIANTS.clear()
 
 pc_of, loc, stage_of = {}, {}, {}
 MAP_ROWS, MAP_CONFLICT_ROWS = {}, {}
@@ -371,7 +372,10 @@ def reflect(key, stage, msl, res):
             elif 'texture_buffer' in ty: e.update(kind='?')   # 无绑定类型化缓冲：回放层未实现 | bindless typed buffer: not implemented in the replay layer
             else: e.update(kind='tex_ubo', reg=ut[0], off=ut[1])
         elif nm.endswith('Smplr'):   # 句柄类型 0 = 贴图与采样器合在同一句柄：采样器号取该贴图槽句柄的高位 | handle type 0 = texture and sampler combined in one handle: the sampler index is taken from the high bits of that texture slot's handle
-            t, s, ty = decode_tex(nm[:-5]); e.update(kind='samp', reg=s) if ty else e.update(kind='samp_tex', reg=t)
+            d = decode_tex(nm[:-5])
+            if not d: e.update(kind='?')   # 句柄编码认不出（不是本作 NVN 的贴图句柄表）：当作未知绑定，让运行时报红，而不是让整批构建崩掉
+            else:
+                t, s, ty = d; e.update(kind='samp', reg=s) if ty else e.update(kind='samp_tex', reg=t)
         else:
             d = decode_tex(nm)
             if not d: e.update(kind='?')
@@ -480,9 +484,10 @@ def vs_pad(key, src):
     k = src.find('main0_out out = {};') + len('main0_out out = {};')
     return src[:k] + ''.join(f'\n    out.dm_pad{l} = float4(0.0, 0.0, 0.0, 1.0);' for l in miss) + src[k:], miss
 
-def finish(key, w, j, c1):
-    name, k = loc[key]
-    msl = os.path.join(w, key + '.metal'); air = msl[:-6] + '.air'; lib = os.path.join(out, key + '_b.metallib')
+def finish_msl(key, w, j):
+    """翻译 + 出 MSL（不编译）。返回 (状态, 错误, (msl 路径, src, res))。
+    Translation and MSL generation only, no compilation: the compiler step is batched across all shaders (see compile_pending)."""
+    msl = os.path.join(w, key + '.metal')
     r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
     src = open(msl).read()
@@ -499,21 +504,19 @@ def finish(key, w, j, c1):
     if j['stage'] == 'vs' and PAIRS.get(key):   # 像素着色器读而顶点没写的输出补成 (0,0,0,1)（见 vs_pad） | outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad)
         src, pad = vs_pad(key, src)
         if pad: open(msl, 'w').write(src)
-    res = json.load(open(os.path.join(w, key + '.res.json')))
-    try:
-        subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
-        tmp_lib = lib + '.tmp-' + str(os.getpid())
-        subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', tmp_lib], check=True)
-        os.replace(tmp_lib, lib)
-    except subprocess.CalledProcessError as e:
-        return 'metal 失败', str(e)[:160], None
+    return 'ok', '', (msl, src, pad, json.load(open(os.path.join(w, key + '.res.json'))))
+
+def compile_pending(pairs, log=None):
+    """批量编译；pairs = [(key, msl, lib)]。返回 {key: 失败原因或 None}。
+    一次跨越 Windows 边界编完整批：WSL 里每个 Windows 进程约 116 ms，逐个调要一小时纯开销。"""
+    if not pairs: return {}
+    errs = metal_tool.compile_batch([(msl, lib) for _, msl, lib in pairs], 'macosx', (), log)
+    return {k: e for (k, _, _), e in zip(pairs, errs)}
+
+def publish(key, msl, src, pad, res, j, c1):
+    """编译成功后写反射、推变体（编译已在外面完成）。"""
+    name, k = loc[key]
     clone(msl, os.path.join(out, key + '_b.metal'))
-    if IOSOUT:   # iOS：同一份 MSL 走 iOS 的唯一编译口径（dm/ios/tools/ios_metal.py）出 iphoneos metallib | iOS: the same MSL goes through iOS's single compile convention (dm/ios/tools/ios_metal.py) to produce an iphoneos metallib
-        ilib = os.path.join(IOSOUT, key + '_b.metallib')
-        try:
-            ios_metal.compile(msl, msl[:-6] + '.ios.air', ilib + '.tmp')
-            os.replace(ilib + '.tmp', ilib)
-        except subprocess.CalledProcessError as e: return 'iOS metal 失败', str(e)[:160], None
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
@@ -524,7 +527,10 @@ def finish(key, w, j, c1):
             'raster': raster_facts(j['stage'], src), 'vs_pad': pad}
     write_refl(key, refl)
     fetch_finish(key, src, refl)
-    return 'ok', '', refl
+    if key in PENDING_VARIANTS:
+        refl['fetch'] = PENDING_VARIANTS[key][2]
+        write_refl(key, refl)
+    return refl
 
 keys = sorted(want) if want else sorted(loc)
 NJ = int(os.environ.get('J', '8'))
@@ -561,17 +567,40 @@ for r in xr:
     for ln in r.stderr.splitlines():
         m = re.match(r'【红】(\w+)：(.*)', ln)
         if m: xerr[m.group(1)] = m.group(2)[:160]
-def fin(key):
+def fin_msl(key):
+    """第一轮：翻译 + 出 MSL，并把待编任务攒起来。"""
     if key in cache_hits:
         refl = json.load(open(os.path.join(out, key + '_b.json')))
         src = open(os.path.join(out, key + '_b.metal')).read() if refl['stage'] == 'ps' else ''
-        return key, 'ok', '', fetch_finish(key, src, refl)
+        fetch_finish(key, src, refl)
+        return key, 'ok', '', None
     if key in xerr or not os.path.exists(os.path.join(w, key + '.spv')): return key, '翻译失败', xerr.get(key, '无 spv'), None
-    result = (key,) + finish(key, w, jobs[key], c1s[key])
-    if result[1] == 'ok': publish_cache(key, digests[key], rule_fps[key], CODE_FP)
-    return result
+    st, err, out_ = finish_msl(key, w, jobs[key])
+    return key, st, err, out_
 with cf.ThreadPoolExecutor(NJ) as ex:   # 两段：配对的顶点着色器要读配对像素着色器的 MSL（vs_pad），排在最后 | two phases: paired vertex shaders read their pixel shaders' MSL (vs_pad), so they go last
-    res = list(ex.map(fin, [k for k in keys if k not in PAIRS])) + list(ex.map(fin, [k for k in keys if k in PAIRS]))
+    res = list(ex.map(fin_msl, [k for k in keys if k not in PAIRS])) + list(ex.map(fin_msl, [k for k in keys if k in PAIRS]))
+
+# 第二轮：编译。全部 MSL 已就位，一次跨越 Windows 边界编完整批（WSL 里每个 Windows 进程约 116 ms，
+# 逐个调 16000 个要一小时纯开销）；没有苹果编译器时这里只把源码拷成库文件。
+# Second round: compile. Every MSL is ready, so one Windows crossing compiles the whole batch (each Windows process
+# costs ~116 ms from WSL; calling it 16000 times is an hour of pure overhead); with no Apple compiler this just copies source into the library files.
+PENDING_SHADERS = {}
+for key, st, err, o in res:
+    if st == 'ok' and o: PENDING_SHADERS[key] = o
+if PENDING_SHADERS:
+    serrs = compile_pending([(k, o[0], os.path.join(out, k + '_b.metallib')) for k, o in PENDING_SHADERS.items()],
+                            log=os.path.join(out, '_b_compile.log'))
+    if IOSOUT:
+        ierrs = metal_tool.compile_batch([(o[0], os.path.join(IOSOUT, k + '_b.metallib')) for k, o in PENDING_SHADERS.items()], 'iphoneos', ios_metal.FLAGS)
+    else:
+        ierrs = [None] * len(PENDING_SHADERS)
+    fixed = []
+    for (key, o), e, ie in zip(PENDING_SHADERS.items(), serrs.values(), ierrs):
+        if e or ie: fixed.append((key, 'metal 失败', (e or ie)[:160], None)); continue
+        fixed.append((key, 'ok', '', publish(key, o[0], o[1], o[2], o[3], jobs[key], c1s[key])))
+        publish_cache(key, digests[key], rule_fps[key], CODE_FP)
+    res = [r for r in res if r[0] not in PENDING_SHADERS] + fixed
+compile_variants()   # 可读 tile 变体同样批量编（在 publish / fetch_finish 里攒的） | the readable-tile variants are batched too (accumulated in publish / fetch_finish)
 shutil.rmtree(w, ignore_errors=True)
 st = collections.Counter(r[1] for r in res)
 print(f'着色器 {len(res)}：成功 {st["ok"]}，' + '，'.join(f'{k} {v}' for k, v in st.items() if k != 'ok'))

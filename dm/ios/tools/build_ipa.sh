@@ -3,6 +3,7 @@
 # Prerequisites: the rewriter (patched directory) and the iOS shader build (IOSOUT) have been run as in the README; Xcode and xcodegen are installed.
 # Usage: dm/ios/tools/build_ipa.sh [output.ipa]; environment: GAME=game profile (dm/games/<base game title ID>, required), W=the game's work folder (required: <NSP folder>/<title ID>-work, never the home folder), PATCHED / ROMFS / MSL_IOS can each be overridden
 #   AOC=add-on content directory (default $W/data/aoc; when it exists it goes to DmIOS.app/aoc/<index>/; an empty string = none)
+#   DM_SHADER_FROM_SOURCE=1 builds the compile-on-device branch into the host (for packages whose shader libraries hold MSL source, i.e. DM_METAL=nometal);
 #   The app name is the game name in the base NSP's control data ($W/data/v0/control.nacp, else the one next to the RomFS), the bundle ID is org.nxnative.<base game title ID in lowercase> (DM_DISPLAY_NAME / DM_BUNDLE_ID override them);
 #   the IPA name, code modules, RomFS marker and shader tables come from the game profile
 set -u
@@ -24,12 +25,17 @@ export LC_ALL=C DM_BUNDLE_ID=${DM_BUNDLE_ID:-org.nxnative.$(echo "$GAME" | tr 'A
 for f in $MODS; do [ -f "$PATCHED/$f.patched.bin" ] && [ -f "$PATCHED/$f.fixups.tsv" ] || die "no rewritten module $PATCHED/$f (run dm/tools/patch_nso.py first)"; done
 [ -e "$ROMFS/$MARKER" ] || die "no RomFS at $ROMFS (missing $MARKER)"
 V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' "$GD/dmsh_chain.h")
+# With DM_METAL=nometal the *_b.metallib files hold MSL source instead of a compiled library (the host compiles them on device);
+# the file names and the chain version are the same either way, so this check does not care which it is
 [ -n "$V" ] && ls "$MSL_IOS/b-$V" 2> /dev/null | grep -q '_b.metallib$' || die "no iOS shader libraries $MSL_IOS/b-$V (IOSOUT=$MSL_IOS dmsh_build.py ...)"
 
 t "app: $DM_DISPLAY_NAME ($DM_BUNDLE_ID)"
 t "generate Gen/ (host sources, embedded modules, tables, shader libraries)"
 rm -rf Gen && mkdir -p Gen/dm Gen/msl || die "mkdir Gen"
 python3 tools/gen_build.py ../host Gen > Gen/dm.xcconfig || die "gen_build"
+# DM_SHADER_FROM_SOURCE：库文件里是 MSL 源码时，宿主要在设备上现编（见 nvn_mtl.m 的 lib_from_file）
+# DM_SHADER_FROM_SOURCE: when the library files hold MSL source, the host compiles it on device (see lib_from_file in nvn_mtl.m)
+[ "${DM_SHADER_FROM_SOURCE:-0}" = 1 ] && echo "OTHER_CFLAGS = \$(inherited) -DDM_SHADER_FROM_SOURCE" >> Gen/dm.xcconfig
 F=$(python3 tools/gen_embed.py "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"
 echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
 cp "$PATCHED"/*.fixups.tsv "$PATCHED"/*.gates.tsv "$PATCHED"/*.params.tsv "$PATCHED"/*.cuts.tsv "$PATCHED"/*.obs.tsv Gen/dm/ || die "copy rewriter tables"

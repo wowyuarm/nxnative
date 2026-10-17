@@ -3,3 +3,6 @@
 .iosdd_mac/
 .iosdd_*/
 .DS_Store
+__pycache__/
+*.pyc
+.ios-sdk/

@@ -62,7 +62,7 @@ To add a game:
 
 ## Build by hand (Mac)
 
-You need the same tools as the script. The shader translator is the prebuilt `dm/gfx/tools/dmsh_xlate_bin`, the build that matches `dmsh_chain.lock`; a fresh `dotnet publish` gives different fingerprints. The commands use three variables:
+You need the same tools as the script. The shader translator is the prebuilt `dm/gfx/tools/dmsh_xlate_bin`, the build that matches `dmsh_chain.<toolchain>.lock`; a fresh `dotnet publish` gives different fingerprints. The commands use three variables:
 - `G`, the profile;
 - `W`, the game's work folder: `<title ID>-work` inside the game's NSP folder, outside this repository and off the home folder (it grows to the size of the game files);
 - `VER`, a version folder named after the NSP version.

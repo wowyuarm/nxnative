@@ -39,7 +39,7 @@ Needs iOS / iPadOS 26 or later. Other games aren't supported yet: for them the s
 
 ## Pack an IPA
 
-**1. Get nxnative and its tools** (once, on a Mac with [Xcode](https://apps.apple.com/app/xcode/id497799835) and [Homebrew](https://brew.sh)):
+**1. Get nxnative and its tools** (once). A Mac with [Xcode](https://apps.apple.com/app/xcode/id497799835) and [Homebrew](https://brew.sh) is the simplest setup:
 
 ```
 git clone https://github.com/seedds/nxnative.git && cd nxnative
@@ -47,6 +47,8 @@ brew install xcodegen zstd spirv-cross
 brew install --cask dotnet-sdk
 python3 -m pip install lz4 capstone fonttools
 ```
+
+Linux and Windows (through WSL) work too, without Xcode — see [docs/NO_XCODE.md](docs/NO_XCODE.md). Without Apple's shader compiler the shaders are compiled on the phone the first time the game runs (about 7 minutes once, measured on a comparable workload).
 
 **2. Put one game's NSPs in a folder**, base game and update (and any DLC):
 
@@ -142,7 +144,7 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license; see [dm/th
 
 ## 打包 IPA
 
-**1. 获取 nxnative 和所需工具**（只需一次，在装有 [Xcode](https://apps.apple.com/app/xcode/id497799835) 和 [Homebrew](https://brew.sh) 的 Mac 上）：
+**1. 获取 nxnative 和所需工具**（只需一次）。有 [Xcode](https://apps.apple.com/app/xcode/id497799835) 和 [Homebrew](https://brew.sh) 的 Mac 最省事：
 
 ```
 git clone https://github.com/seedds/nxnative.git && cd nxnative
@@ -150,6 +152,8 @@ brew install xcodegen zstd spirv-cross
 brew install --cask dotnet-sdk
 python3 -m pip install lz4 capstone fonttools
 ```
+
+Linux 和 Windows（经 WSL）也能出包，不需要 Xcode，见 [docs/NO_XCODE.md](docs/NO_XCODE.md)。没有苹果的着色器编译器时，着色器在游戏首次运行时于手机上编一次（同类工作量的实测约 7 分钟，一次性）。
 
 **2. 把一个游戏的 NSP 放进一个文件夹**，本体和更新（有 DLC 也放进去）：
 

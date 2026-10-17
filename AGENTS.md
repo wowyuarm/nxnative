@@ -13,6 +13,7 @@
   3. Regenerate the profile's `c1_full.tsv`.
   4. Rebuild the host.
 
-  The host only loads libraries of its own chain version. The translator is `dm/gfx/tools/dmsh_xlate_bin`, which matches `dmsh_chain.lock`; a fresh `dotnet publish` does not.
+  The host only loads libraries of its own chain version. The translator is `dm/gfx/tools/dmsh_xlate_bin`, which matches `dmsh_chain.<toolchain>.lock`; a fresh `dotnet publish` does not.
 - iOS builds are unsigned IPAs that the user sideloads and tests; diagnostics come back as the app's `Documents/log.txt`. Do not sign or install builds on the user's devices.
+- The build runs on macOS (Xcode: `dm/ios/tools/build_ipa.sh`) and on Linux / Windows through WSL (`dm/ios/tools/build_ipa_nowin.py`: clang + ld64.lld + a public iPhoneOS SDK). `scripts/build_ipa_from_nsp.py` picks the route itself. `dm/gfx/tools/metal_tool.py` is the single decision point for the shader compiler: `macos` / `windows` (Apple's Metal Developer Tools for Windows) / `nometal` (MSL source ships in the package, the host compiles it on device through `DM_SHADER_FROM_SOURCE`). Its answer feeds the chain version through `dmsh_chain.<toolchain>.lock` — never share one lock between toolchains, and never hard-code `xcrun`: go through `metal_tool`. Shader compiles are batched (`compile_batch`) because a Windows process costs about 116 ms from WSL. Setup and trade-offs: [docs/NO_XCODE.md](docs/NO_XCODE.md).
 - Commit only when asked, with `git -c user.name=seedds -c user.email=ext6@xcra.ai commit`.

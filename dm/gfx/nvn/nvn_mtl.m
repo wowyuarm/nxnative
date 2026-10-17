@@ -2208,14 +2208,22 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
     if (fd < 0 || fstat(fd, &st) || st.st_size <= 0) { if (fd >= 0) close(fd); if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"打不开 %@", path]}]; return nil; }
     size_t len = (size_t)st.st_size; void *m = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0); close(fd);
     if (m == MAP_FAILED) { if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"映射失败 %@", path]}]; return nil; }
-#ifdef DM_SHELL
-    // Shell: when the user's computer has no Apple shader compiler (the no-compiler mode of tools/d2rm_pack.py, gfx/tools/nometal_run.py), the "library files" contain
-    // shader source rather than compiled libraries (a compiled library starts with MTLB). They are compiled here on the spot; the system caches the compiled result, and from the second launch on the same shader no longer costs this time.
+#if defined(DM_SHELL) || defined(DM_SHADER_FROM_SOURCE)
+    // Shell / no-compiler builds: when the user's computer has no Apple shader compiler (the no-compiler mode of tools/d2rm_pack.py, gfx/tools/nometal_run.py,
+    // or this repo built with DM_METAL=nometal), the "library files" contain shader source rather than compiled libraries (a compiled library starts with MTLB).
+    // They are compiled here on the spot; the system caches the compiled result, and from the second launch on the same shader no longer costs this time.
     // Measured on a real device (cold): about 80 ms each on average, about 450 ms for the longest single one; one session uses several hundred.
     if (len < 4 || memcmp(m, "MTLB", 4)) { NSString *src = [[NSString alloc] initWithBytes:m length:len encoding:NSUTF8StringEncoding]; munmap(m, len);
         if (!src) { if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:EILSEQ userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"既不是编好的库也不是源码 %@", path]}]; return nil; }
         static _Atomic int n; static _Atomic long long us; CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-        id<MTLLibrary> l = [g_dev newLibraryWithSource:src options:nil error:err]; long long dt = (long long)((CFAbsoluteTimeGetCurrent() - t0) * 1e6);
+        // mathMode = relaxed：与命令行 -fmetal-math-mode=relaxed 同一语义（允许重排 / 合并，但不许假设没有 NaN / Inf）。
+        // 翻译出的着色器靠 isnan 选择复现 Maxwell 的 NaN 语义，缺省 fast 会让后端把那些判断当成恒假。
+        // mathMode = relaxed: the same semantics as the command-line -fmetal-math-mode=relaxed (reassociation and contraction allowed, but no assumption that NaN / Inf never happen).
+        // The translated shaders reproduce Maxwell's NaN semantics with isnan selects, and the default fast mode lets the backend treat those as always false.
+        MTLCompileOptions *co = [MTLCompileOptions new];
+        if ([co respondsToSelector:@selector(setMathMode:)]) co.mathMode = MTLMathModeRelaxed;
+        else co.fastMathEnabled = YES;
+        id<MTLLibrary> l = [g_dev newLibraryWithSource:src options:co error:err]; long long dt = (long long)((CFAbsoluteTimeGetCurrent() - t0) * 1e6);
         int k = atomic_fetch_add(&n, 1) + 1; long long tot = atomic_fetch_add(&us, dt) + dt;
         if (k == 1 || k % 100 == 0 || dt >= 300000) MLOG("着色器现编：第 %d 个 %.0f ms，累计 %.1f 秒", k, dt / 1e3, tot / 1e6);
         return l; }

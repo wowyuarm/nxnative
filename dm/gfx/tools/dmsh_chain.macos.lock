@@ -3,6 +3,7 @@ dmsh_xlate.dll	6dd3441c31b57475
 Ryujinx.Graphics.Shader.dll	950b659a54a52636
 Ryujinx.Common.dll	74f785bc3a81386e
 xlate_source	23b85cb2e58b9c36
-spirv-cross	d9dc197f061b42a5
+metal_toolchain	macos
+spirv-cross	vulkan-sdk-1.4.357.0
 metal_macosx	Apple metal version 32023.921 (metalfe-32023.921.6)
 metal_iphoneos	Apple metal version 32023.921 (metalfe-32023.921.6)

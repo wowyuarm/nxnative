@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # Unsigned IPA straight from the NSPs: identify the game (title ID → game profile dm/games/<id>/) → extract (nx_extract) → rewrite the code modules (patch_nso.py) → split out the shaders and check them against the profile's tables (shader_split.py)
-#   → iOS shader libraries (dmsh_build.py) → build_ipa.sh. A game with no matching profile is only surveyed (<NSP folder>/<title ID>_survey/survey.md); no IPA.
+#   → iOS shader libraries (dmsh_build.py) → the IPA (build_ipa.sh on a Mac, build_ipa_nowin.py elsewhere). A game with no matching profile is only surveyed (<NSP folder>/<title ID>_survey/survey.md); no IPA.
+# Platforms: macOS uses Xcode (xcodegen + xcodebuild) and xcrun for shaders. Linux / Windows (WSL) build the same app with clang + ld64.lld against a
+#   public iPhoneOS SDK and compile shaders with whatever Apple toolchain is present — the Windows Metal Developer Tools, or none at all
+#   (DM_METAL=nometal: the MSL source ships in the package and is compiled on the device the first time each shader is used).
+#   See dm/gfx/tools/metal_tool.py for how the toolchain is chosen and docs/NO_XCODE.md for the setup.
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
 #   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted). Command-line options entered in Spyder's run configuration work the same way.
 # Uses only three things: this repository, a folder holding one game's NSPs (the base game plus the updates listed in the profile's shader_versions are required; DLC NSPs, when present, are packed too and unlock the add-on content already in the game), and prod.keys.
 # Every intermediate file is under <id>_build/ in the NSP folder: extract/ (the extracted game files, deleted after the IPA is built by default), aoc/ (each DLC's RomFS by index), tools/, patched_*/, shader/ (shader package and caches, kept so the next build is fast), logs/ (each step's full output), tmp/, ipa/. The finished IPA also goes to the NSP folder by default.
-# The shader translator is the in-repo dm/gfx/tools/dmsh_xlate_bin (the build whose fingerprints match dmsh_chain.lock; a rebuilt dll has different fingerprints and dmsh_build refuses it).
-# The Python running this file needs lz4, capstone and fonttools; also needed: Xcode, xcodegen, .NET SDK 10, zstd, spirv-cross. For Mario the first run takes about 35 minutes (mostly the shader libraries); later runs take about 10 (the shader libraries come from the cache). Key values are never printed.
+# The shader translator is the in-repo dm/gfx/tools/dmsh_xlate_bin (the build whose fingerprints match dmsh_chain.<toolchain>.lock; a rebuilt dll has different fingerprints and dmsh_build refuses it).
+# The Python running this file needs lz4, capstone and fonttools; also needed: .NET SDK 10, zstd, spirv-cross, plus either Xcode + xcodegen (macOS) or clang + lld + an iPhoneOS SDK (Linux / Windows). For Mario the first run takes about 35 minutes (mostly the shader libraries); later runs take about 10 (the shader libraries come from the cache). Key values are never printed.
 import collections, ctypes, getpass, os, re, shutil, struct, subprocess, sys, tempfile, threading, time, zlib
 from pathlib import Path
 
@@ -276,13 +280,34 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
 
 
 # ---- Steps ----
-def check_prereqs(env, xlate):
+def metal_profile(repo, env):
+    """这台机器用哪套 Metal 工具链（macos / windows / nometal）；与 dm/gfx/tools/metal_tool.py 同一判定。
+    Which Metal toolchain this machine has (macos / windows / nometal); the same decision as dm/gfx/tools/metal_tool.py."""
+    sys.path.insert(0, str(repo / 'dm/gfx/tools'))
+    import metal_tool
+    return metal_tool.profile()
+
+
+def check_prereqs(env, xlate, profile):
     missing = [m for m in ('lz4.block', 'capstone', 'fontTools') if not _importable(m)]
     if missing: raise BuildError(f'当前 Python（{sys.executable}）缺模块 | the current Python is missing modules: {", ".join(missing)}（pip install lz4 capstone fonttools）')
-    tools = {'xcodebuild': 'Xcode', 'xcodegen': 'brew install xcodegen', 'dotnet': '.NET SDK 10', 'zstd': 'brew install zstd', 'spirv-cross': 'brew install spirv-cross', 'zip': 'zip', 'make': 'Xcode'}
-    gone = [f'{t}（{how}）' for t, how in tools.items() if not shutil.which(t, path=env['PATH'])]
+    # 共用工具：NSP 解包、改写、着色器翻译
+    common = {'dotnet': '.NET SDK 10（https://dotnet.microsoft.com/download）', 'zstd': 'zstd（apt install zstd / brew install zstd）',
+              'spirv-cross': 'spirv-cross（vulkan-sdk-1.4.357.0；见 docs/NO_XCODE.md 的编法）'}
+    gone = [f'{t}（{how}）' for t, how in common.items() if not shutil.which(t, path=env['PATH'])]
+    if profile == 'macos':   # Mac 路线：Xcode 出 .app，xcrun 编 metallib
+        gone += [f'{t}（{how}）' for t, how in {'xcodebuild': 'Xcode', 'xcodegen': 'brew install xcodegen', 'make': 'Xcode'}.items()
+                 if not shutil.which(t, path=env['PATH'])]
+    else:                    # 非 Mac 路线：clang + ld64.lld 出 .app，需要公开的 iPhoneOS SDK
+        gone += [f'{t}（{how}）' for t, how in {'clang': 'clang（apt install clang）', 'ld64.lld': 'LLVM 链接器（apt install lld）'}.items()
+                 if not shutil.which(t, path=env['PATH'])]
+        if not (os.environ.get('DM_IOS_SDK') or any(os.path.isdir(d) for d in (os.path.expanduser('~/ios-sdk'), '/opt/ios-sdk'))):
+            gone.append('iPhoneOS SDK（设 DM_IOS_SDK，或放到 ~/ios-sdk/iPhoneOS26.5.sdk；公开仓库 xybp888/iOS-SDKs）')
+        if profile == 'windows':
+            if not shutil.which('python.exe'): gone.append('Windows 侧的 python.exe（Metal 工具链是 Windows 程序，批量驱动在 Windows 侧跑；或用 DM_WIN_PYTHON 指定）')
     if gone: raise BuildError('找不到工具 | tools not found: ' + '，'.join(gone))
-    if not xlate.exists(): raise BuildError(f'仓内没有着色器翻译器 | the shader translator is missing from the repository: {xlate}')
+    if not xlate.exists() and not (xlate.parent / 'dmsh_xlate.dll').exists():
+        raise BuildError(f'仓内没有着色器翻译器 | the shader translator is missing from the repository: {xlate}')
 
 
 def _importable(m):
@@ -419,7 +444,8 @@ def main(args=None):
     # DM_GAME picks the profile; DM_ROOT / WORK point at <id>_build: the tools' default paths and temporary directories all stay inside it
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'))
     logs = work / 'logs'
-    check_prereqs(env, xlate)
+    profile = metal_profile(repo, env)
+    check_prereqs(env, xlate, profile)
     picks = pick_nsps(fam, versions)
 
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
@@ -456,7 +482,13 @@ def main(args=None):
     else: say('【红】解包里没有游戏图标（之前的解包没存图标：删掉 extract/ 重跑即可补上）；主屏图标会是空白 | no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the home-screen icon will be blank')
     env_file = args.env_file or DM_ENV_FILE
     if env_file: ipa_env['DM_ENV_FILE'] = str(Path(os.path.expanduser(env_file)).resolve())
-    run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env)
+    if profile == 'macos':
+        run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env)
+    else:
+        # 不用 Xcode：clang + ld64.lld 对着公开的 iPhoneOS SDK 直接出可执行文件（dm/ios/tools/build_ipa_nowin.py）
+        # Without Xcode: clang + ld64.lld against a public iPhoneOS SDK (dm/ios/tools/build_ipa_nowin.py)
+        if profile == 'nometal': ipa_env['DM_SHADER_FROM_SOURCE'] = '1'
+        run([py, repo / 'dm/ios/tools/build_ipa_nowin.py', out_ipa], logs / 'build_ipa.log', env=ipa_env)
     if not out_ipa.is_file(): raise BuildError(f'没出 IPA | no IPA at {out_ipa}')
     rmtree(work / 'tmp')
     if not (args.keep_extracted or KEEP_EXTRACTED):

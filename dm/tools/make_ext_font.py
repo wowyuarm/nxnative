@@ -2,7 +2,7 @@
 # Generate a stand-in for the "Nintendo extension" shared font (nintendo_ext.ttf): controller-button icons at the original private-use code points (A/B/X/Y, L/R/ZL/ZR/SL/SR, +/−, D-pad, stick direction arrows).
 # The host has no original system fonts; button icons in game text (e.g. Mario's GameMsg/Key.msbt: U+E0E0 = A button) render as "?" when the glyph is missing. Letters come from macOS's Arial Rounded Bold, knocked out of a solid plate.
 # Usage: make_ext_font.py out.ttf [letter-font.ttf]; needs fontTools (pip install fonttools)
-import math, sys
+import math, os, sys
 from fontTools.ttLib import TTFont
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
@@ -67,6 +67,28 @@ def cross(cx, cy, half, arm):   # D-pad outline (one closed ring)
     return [(cx - a, cy + h, 1), (cx + a, cy + h, 1), (cx + a, cy + a, 1), (cx + h, cy + a, 1), (cx + h, cy - a, 1), (cx + a, cy - a, 1),
             (cx + a, cy - h, 1), (cx - a, cy - h, 1), (cx - a, cy - a, 1), (cx - h, cy - a, 1), (cx - h, cy + a, 1), (cx - a, cy + a, 1)]
 
+# 字母字体的缺省位置：macOS 的 Arial Rounded Bold（圆角、与按键图标形状相配）；其他系统上退到任何一款圆体 / 无衬线粗体
+# Default letter font: macOS's Arial Rounded Bold (rounded, matching the button icons); on other systems fall back to any rounded / sans bold face
+LETTER_FONTS = [
+    '/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+    '/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf',
+]
+
+
+def default_letter_font():
+    for p in LETTER_FONTS:
+        if os.path.exists(p): return p
+    import subprocess
+    try:
+        r = subprocess.run(['fc-match', '-f', '%{file}', 'sans:bold'], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip() and os.path.exists(r.stdout.strip()): return r.stdout.strip()
+    except OSError:
+        pass
+    sys.exit('找不到字母字体：把一款 TTF 路径作为第二个参数传进来')
+
+
 def build(out, letter_font):
     L = Letters(letter_font); glyphs = {}; adv = {}; cmap = {}
     def glyph(name, codes, width, draw):
@@ -128,4 +150,4 @@ def build(out, letter_font):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2: sys.exit(__doc__ or 'usage: make_ext_font.py out.ttf [letter-font.ttf]')
-    build(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else '/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf')
+    build(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else default_letter_font())
