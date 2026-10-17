@@ -379,7 +379,9 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g):
 def build_shaders(py, repo, sh, xlate, env, logs, g):
     say('出 iOS 着色器库（马力欧首次约 30 分钟，之后走缓存约 7 分钟）| building the iOS shader libraries (Mario: about 30 minutes the first time, about 7 with the cache)')
     ios = sh / 'ios'
-    run([py, repo / 'dm/gfx/tools/dmsh_build.py', sh / 'pkg', sh / 'cache'], logs / 'dmsh_build.log', env=dict(env, XLATE=str(xlate), IOSOUT=str(ios)), quiet=True)
+    # 不在这里钉死翻译器路径：dmsh_build.py 自己按平台选（Mac 的 apphost 在 Linux / Windows 上不能执行）
+    # Do not pin the translator path here: dmsh_build.py picks per platform (the macOS apphost cannot run on Linux / Windows)
+    run([py, repo / 'dm/gfx/tools/dmsh_build.py', sh / 'pkg', sh / 'cache'], logs / 'dmsh_build.log', env=dict(env, IOSOUT=str(ios)), quiet=True)
     chain = re.search(r'#define DMSH_CHAIN "(.*)"', g.table('dmsh_chain.h').read_text()).group(1)
     libs = ios / f'b-{chain}'
     n = sum(1 for _ in libs.glob('*_b.metallib')) if libs.is_dir() else 0

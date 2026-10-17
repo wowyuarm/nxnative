@@ -62,6 +62,14 @@ def version():
     h.update(options().encode())
     return h.hexdigest()[:12]
 
+def write_header():
+    """把本机算出的 V 写进游戏档案的 dmsh_chain.h。V 随工具链变（见 LOCK），所以这是每次构建的一步，不是一次性的事。
+    Write this machine's V into the profile's dmsh_chain.h. V follows the toolchain (see LOCK), so this is a build step, not a one-off."""
+    v = version()
+    open(HEADER, 'w').write(f'// 生成文件（dm/gfx/tools/dmsh_chain.py --header，游戏 {GAME.id}，工具链 {metal_tool.profile()}）：本源码树期望的 B 着色器库翻译链版本（缺省选项）；宿主只加载 <库目录>/b-<V>/\n'
+                            f'#define DMSH_CHAIN "{v}"\n')
+    return v
+
 def sha16(p): return hashlib.sha256(open(p, 'rb').read()).hexdigest()[:16]
 
 def tools_now():
@@ -103,8 +111,6 @@ if __name__ == '__main__':
         for b in bad: print('【红】翻译链工具与锁文件不符：' + b)
         sys.exit(1 if bad else 0)
     elif a == ['--header']:
-        open(HEADER, 'w').write(f'// 生成文件（dm/gfx/tools/dmsh_chain.py --header，游戏 {GAME.id}）：本源码树期望的 B 着色器库翻译链版本（缺省选项）；宿主只加载 <库目录>/b-<V>/\n'
-                                f'#define DMSH_CHAIN "{version()}"\n')
-        print(version())
+        write_header(); print(version())
     elif not a: print(version())
     else: sys.exit(__doc__ if __doc__ else '用法见文件头')

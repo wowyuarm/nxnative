@@ -19,20 +19,33 @@ import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tem
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 HOME = os.path.expanduser('~')
 dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import dmsh_chain, dmsh_fetch, dmsh_facts   # 翻译链版本：先核工具与锁文件，产物进 b-<V>/ | translation chain version: verify the tools against the lock file first; build output goes into b-<V>/
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import dmsh_chain, dmsh_fetch, dmsh_facts, metal_tool   # 翻译链版本：先核工具与锁文件，产物进 b-<V>/ | translation chain version: verify the tools against the lock file first; build output goes into b-<V>/
 _bad = dmsh_chain.check_tools()
 if _bad: sys.exit('\n'.join('【红】翻译链工具与锁文件不符：' + b for b in _bad) + '\n（换了工具就 dmsh_chain.py --update-lock 并入仓；只是没重编翻译器就重编）')
 CHAIN = dmsh_chain.version(); out = os.path.join(out, 'b-' + CHAIN)
 GAME = dmsh_chain.GAME   # 当前游戏档案（DM_GAME，缺省 smbw）：表与 NVN 常数都从这里取 | the current game profile (DM_GAME, default smbw): the tables and NVN constants come from here
-if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'【红】{dmsh_chain.HEADER} 不是当前翻译链版本 {CHAIN}：先跑 dmsh_chain.py --header（否则宿主找不到这批库）')
-XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
+# 档案里的 dmsh_chain.h 是按提交时的工具链算的；换了工具链（Mac / Windows / nometal）V 就不同。
+# 这里按本机实际工具重算并写回，宿主随后读到同一个 V。V 只由源码与本机工具决定，重算不会让结果漂移。
+# The profile's dmsh_chain.h was computed with the toolchain that was current when it was committed; a different
+# toolchain (macOS / Windows / nometal) gives a different V. Recompute from the tools actually present and write it
+# back, so the host later reads the same V. V is determined by source and local tools only, so this cannot drift.
+_have = open(dmsh_chain.HEADER).read()
+if f'"{CHAIN}"' not in _have:
+    dmsh_chain.write_header()
+    print(f'链版本 {CHAIN}（工具链 {metal_tool.profile()}）写回 {os.path.basename(dmsh_chain.HEADER)}')
+# 翻译器启动命令：XLATE 指定就用它，否则按平台选（Mac 的 apphost 在 Linux / Windows 上不能执行，退回同一个 dll 走 dotnet）
+# The translator command: XLATE when set, otherwise chosen per platform (the macOS apphost cannot run on Linux / Windows;
+# the same dll through dotnet can)
+# 字符串 = 可执行文件路径；列表 = 已经分好的命令（如 dotnet xxx.dll）
+# A string is an executable path; a list is an already-split command (e.g. dotnet xxx.dll)
+XLATE = os.environ.get('XLATE') or dmsh_chain.xlate_cmd()
+XLATE = [XLATE] if isinstance(XLATE, str) else XLATE
 FACTS = dmsh_facts.load()
 if not os.path.exists(dmsh_facts.TABLE): sys.exit(f'【红】没有作答表 {dmsh_facts.TABLE}（随游戏档案；空表 = 全部按缺省作答）')
 IOSOUT = os.environ.get('IOSOUT')   # 设了就同时出 iOS 版（iphoneos metallib + 反射）到该目录 | if set, also build the iOS version (iphoneos metallib + reflection) into that directory
 if IOSOUT:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import metal_tool
 MAIN = os.environ.get('MAIN', f'{DM_ROOT}/data/switch/3.3.94012/Update/ExeFS/main')
 MAP = str(GAME.table('shader_map.tsv'))
 BF_WANT_FILE = str(GAME.table('bf_want.tsv'))
@@ -495,7 +508,7 @@ def finish_msl(key, w, j):
         extra = {l: t for l, t in int_inputs(src).items() if l not in j['attr']}
         if extra:
             j['attr'].update(extra); jp = os.path.join(w, f'job1_{key}.json'); json.dump([j], open(jp, 'w'))
-            rx = subprocess.run([XLATE, jp, w], capture_output=True, text=True)
+            rx = subprocess.run(XLATE + [jp, w], capture_output=True, text=True)
             if rx.returncode or not os.path.exists(os.path.join(w, key + '.spv')): return '翻译失败', ('整数输入重翻：' + rx.stderr.strip())[:160], None
             r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
             if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
@@ -560,7 +573,7 @@ misses = [key for key in keys if key not in cache_hits]
 chunks = [misses[i::NJ] for i in range(NJ)]
 def xl(ch):
     jp = os.path.join(w, f'job_{abs(hash(ch[0]))}.json'); json.dump([jobs[k] for k in ch], open(jp, 'w'))
-    return subprocess.run([XLATE, jp, w], capture_output=True, text=True)
+    return subprocess.run(XLATE + [jp, w], capture_output=True, text=True)
 with cf.ThreadPoolExecutor(NJ) as ex: xr = list(ex.map(xl, [c for c in chunks if c]))
 xerr = {}
 for r in xr:
@@ -610,7 +623,10 @@ for reason in ('新键', '规则变', '代码指纹变化：全部重出'):
 print(f'变体缓存：生成 {BF_STATS["generated"]}，命中 {BF_STATS["hit"]}，重出 {BF_STATS["miss"]}，编译 {BF_STATS["compile"]}')
 for lvl in [k for k in st if k != 'ok']:
     for e, n in collections.Counter(r[2] for r in res if r[1] == lvl).most_common(10): print(f'  [{lvl}] {n:5d}  {e}')
-ok = [r[3] for r in res if r[1] == 'ok']
+# r[3] 只在成功时非空：编译失败的那一条 r[1] 不是 'ok'，但缓存命中的成功项 r[3] 也可能为空（只写 json 不重出 MSL 的情形）
+# r[3] is only set on success: a failed compile has r[1] != 'ok', and a cache-hit success can also leave r[3] empty
+# (the MSL was not regenerated, only the json was written)
+ok = [r[3] for r in res if r[1] == 'ok' and r[3]]
 rd = [x for x in ok if x['drv_reads']]
 print(f'运行时读驱动段的着色器 {len(rd)}（c0 {sum("0" in x["drv_reads"] for x in rd)}，c2 {sum("2" in x["drv_reads"] for x in rd)}）；读到回放层填不了的 {sum(bool(x["drv_unfillable"]) for x in ok)}')
 for e, n in collections.Counter(u for x in ok for u in x['drv_unfillable']).most_common(15): print(f'  填不了 {n:5d}  {e}')
