@@ -10,7 +10,7 @@
 #   metal_win_batch.py：一次跨越，Windows 侧循环编译。compile_batch() 是全链唯一入口。
 # Why one module: the chain version must change exactly when the compiler changes, and every caller
 # (chain lock, iOS compile record, offline build) has to agree on that, or the host refuses libraries it should accept.
-import json, os, shutil, subprocess, sys, tempfile
+import json, os, re, shutil, subprocess, sys, tempfile
 
 PROFILES = ('macos', 'windows', 'nometal')
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,13 +23,24 @@ WIN_CANDIDATES = [
     r'C:\Program Files (x86)\Apple\Metal Developer Tools\bin',
     r'C:\Program Files\Apple\Metal\bin',
 ]
+# 非默认位置：安装时选了别的目录（例如 E:\app\Metal Developer Tools）。用文件名找一层，比穷举盘符可靠。
+# Non-default installs (e.g. E:\app\Metal Developer Tools): look one level down for the folder by name, which is more
+# reliable than enumerating drive letters.
+WIN_SEARCH_DIRS = ['/mnt/' + d for d in 'cdefgh'] + ['/mnt/e/app']
 
 _cached = {}
 
 
 def _win_path(path):
-    """WSL 路径 → Windows 可读的 UNC 路径；已是 Windows 路径时原样返回。"""
+    r"""WSL 路径 → Windows 能打开的路径。三种情况：
+    /mnt/<盘>/...  → <盘>:\...（本来就是 Windows 本地盘，转成 UNC 反而绕远，而且 Windows 程序在那里改名会失败）
+    其它 /...      → \\wsl.localhost\<发行版>\...（WSL 自己的文件系统，只能走 UNC）
+    已是 Windows 路径 → 原样返回
+    A WSL path → a path Windows can open: /mnt/<drive> maps to <drive>: (a Windows-local disk, and going through UNC there
+    makes metal.exe's rename fail), anything else to \\wsl.localhost\<distro>\..., and Windows paths pass through."""
     if not path.startswith('/'): return path
+    m = re.match(r'^/mnt/([a-zA-Z])(/.*)?$', path)
+    if m: return m.group(1).upper() + ':' + (m.group(2) or '/').replace('/', '\\')
     distro = os.environ.get('WSL_DISTRO_NAME')
     if distro: return '\\\\wsl.localhost\\%s%s' % (distro, path.replace('/', '\\'))
     try:
@@ -46,13 +57,73 @@ def _mount(d):
 
 
 def _find_windows_metal():
+    if 'winmetal' in _cached: return _cached['winmetal']
     env = os.environ.get('DM_METAL_EXE')
-    if env: return env
+    if env:
+        p = _mount(env) if not env.startswith('/') else env
+        _cached['winmetal'] = p
+        return p
+    found = None
     for d in WIN_CANDIDATES:
         for name in ('metal.exe', 'metal'):
             p = os.path.join(_mount(d), name)
-            if os.path.exists(p): return p
-    return shutil.which('metal.exe')
+            if os.path.exists(p): found = p; break
+        if found: break
+    if not found:
+        for base in WIN_SEARCH_DIRS:
+            if not os.path.isdir(base): continue
+            try: entries = os.listdir(base)
+            except OSError: continue
+            for e in entries:
+                if 'metal' not in e.lower(): continue
+                for sub in ('bin', 'usr/bin', ''):
+                    p = os.path.join(base, e, sub, 'metal.exe') if sub else os.path.join(base, e, 'metal.exe')
+                    if os.path.exists(p): found = p; break
+                if found: break
+            if found: break
+    if not found: found = shutil.which('metal.exe')
+    _cached['winmetal'] = found
+    return found
+
+
+def _win_tempdir():
+    """Windows 侧可写的临时目录（映射成 WSL 路径）。C:\\Windows\\Temp 普通用户没有写权限，要用用户自己的 Temp。
+    A writable Windows-local temp dir (as a WSL path). C:\\Windows\\Temp is not writable for a normal user; the user's own Temp is."""
+    # 只考虑映射到 Windows 本地盘的位置：WSL 自己的 ~ 是 UNC，Windows 程序在那里改名会失败
+    # Only Windows-local drives: the WSL home is UNC, where a Windows program cannot rename
+    cands = []
+    wt = os.environ.get('DM_WIN_TEMP')
+    if wt: cands.append(_mount(wt) if not wt.startswith('/') else wt)
+    base = os.environ.get('WSL_APPDATA') or ''
+    for u in filter(None, (os.environ.get('WINUSER') or _win_user(), )):
+        cands += ['/mnt/c/Users/%s/AppData/Local/Temp/dmsh_metal' % u]
+    cands += ['/mnt/c/Temp/dmsh_metal', '/mnt/d/Temp/dmsh_metal']
+    for d in cands:
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK): return d
+        except OSError:
+            pass
+    sys.exit('找不到可写的 Windows 临时目录：设 DM_WIN_TEMP 指向 Windows 本地盘上的一个目录')
+
+
+def _win_user():
+    """Windows 用户名（/mnt/c/Users/<name>）。WSL 的 USER 与它可能不同。"""
+    if 'winuser' in _cached: return _cached['winuser']
+    name = None
+    try:
+        r = subprocess.run(['cmd.exe', '/c', 'echo %USERNAME%'], capture_output=True, text=True, cwd='/mnt/c')
+        if r.returncode == 0 and r.stdout.strip(): name = r.stdout.strip()
+    except OSError:
+        pass
+    if not name:
+        try:
+            name = sorted(e for e in os.listdir('/mnt/c/Users')
+                          if os.path.isdir('/mnt/c/Users/' + e) and e not in ('All Users', 'Default', 'Default User', 'Public', 'desktop.ini'))[0]
+        except (OSError, IndexError):
+            name = None
+    _cached['winuser'] = name
+    return name
 
 
 def _xcrun_works():
@@ -140,23 +211,56 @@ def compile_batch(jobs, sdk='iphoneos', flags=(), log=None):
     return _compile_batch_windows(jobs, sdk, flags, log)
 
 
+def _find_windows_python():
+    """Windows 侧的 Python。shutil.which 在 WSL 里查的是 Linux 的 PATH，看不到 Windows 装的 Python。
+    The Windows-side Python. shutil.which searches the Linux PATH, so it does not see a Windows install."""
+    if 'winpy' in _cached: return _cached['winpy']
+    found = None
+    u = _win_user()
+    cands = []
+    if u:
+        base = '/mnt/c/Users/%s/AppData/Local/Programs/Python' % u
+        if os.path.isdir(base):
+            for e in sorted(os.listdir(base), reverse=True):
+                cands.append(os.path.join(base, e, 'python.exe'))
+    cands += ['/mnt/c/Windows/py.exe', '/mnt/c/Python311/python.exe', '/mnt/c/Python312/python.exe', '/mnt/c/Python313/python.exe']
+    for p in cands:
+        if os.path.exists(p): found = p; break
+    if not found: found = shutil.which('python.exe') or shutil.which('py.exe')
+    _cached['winpy'] = found
+    return found
+
+
+def _win_flags(sdk, flags):
+    """Windows 版 metal 不认 -sdk：换成 -target。iOS 的目标三元组与 Xcode 的 -sdk iphoneos 等价。
+    The Windows build has no -sdk: use -target. The iOS triple is what Xcode's -sdk iphoneos means."""
+    tgt = {'iphoneos': 'air64-apple-ios', 'macosx': 'air64-apple-macos'}.get(sdk)
+    out = list(flags)
+    if tgt and not any(f.startswith('-target') for f in out): out += ['-target', tgt]
+    return out
+
+
 def _compile_batch_windows(jobs, sdk, flags, log):
     """一次 Windows 进程编译整批，避免每次 116 ms 的跨边界开销。"""
     metal = _find_windows_metal()
     if not metal: sys.exit('DM_METAL=windows 但找不到 metal.exe：设 DM_METAL_EXE，或装 Apple 的 Metal Developer Tools for Windows')
     # Windows 侧要有 Python：优先 python.exe，否则 py -3
-    winpy = os.environ.get('DM_WIN_PYTHON') or shutil.which('python.exe') or shutil.which('py.exe')
+    winpy = os.environ.get('DM_WIN_PYTHON') or _find_windows_python()
     if not winpy:
-        for c in (r'C:\Users\%s\AppData\Local\Programs\Python\Python313\python.exe',):
-            pass
-        cand = shutil.which('python3.exe')
-        winpy = cand
-    if not winpy:
-        sys.exit('找不到 Windows 侧的 python.exe（Metal 工具链是 Windows 程序，批量驱动要在 Windows 侧跑）：装一个，或用 DM_WIN_PYTHON 指定')
-    man = {'metal': _win_path(metal), 'sdk': sdk, 'flags': list(flags),
-           'jobs': [[_win_path(s), _win_path(l)] for s, l in jobs]}
-    fd, mp = tempfile.mkstemp(suffix='.json'); os.close(fd)
-    rp = mp + '.res'
+        sys.exit('找不到 Windows 侧的 python（Metal 工具链是 Windows 程序，批量驱动要在 Windows 侧跑）：装一个，或用 DM_WIN_PYTHON 指定')
+    # 输出交给 Windows 侧写到本地临时目录：metal.exe 先写 .tmp 再改名，UNC 上这一步会失败（invalid argument）。
+    # 输入可以直接读 UNC，输出不行。
+    # Outputs go to a Windows-local temp dir: metal.exe writes a .tmp and renames it, which fails over UNC
+    # (invalid argument). Inputs can be read from UNC; outputs cannot be written there.
+    wtmp = _win_tempdir()
+    staged = []
+    for i, (s, l) in enumerate(jobs):
+        staged.append((_win_path(s), _win_path(os.path.join(wtmp, '%d.metallib' % i))))
+    man = {'metal': _win_path(metal), 'sdk': sdk, 'flags': _win_flags(sdk, flags), 'jobs': [list(x) for x in staged],
+           'work': _win_path(wtmp), 'workers': int(os.environ.get('J') or 8)}
+    # 作业与结果文件也放在 Windows 本地目录：结果由 Windows 侧写回，写在 UNC 上会失败
+    # The job and result files live in the Windows-local dir too: Windows writes the result, which fails over UNC
+    mp = os.path.join(wtmp, 'job-%d.json' % os.getpid()); rp = mp + '.res'
     try:
         with open(mp, 'w', encoding='utf-8') as f: json.dump(man, f)
         r = subprocess.run([winpy, _win_path(BATCH), _win_path(mp), _win_path(rp)], capture_output=True, text=True)
@@ -164,7 +268,21 @@ def _compile_batch_windows(jobs, sdk, flags, log):
         if not os.path.exists(rp):
             sys.exit('Windows 侧批量编译没有产出结果文件（%s）：%s' % (rp, (r.stdout + r.stderr).strip()[-400:]))
         with open(rp, encoding='utf-8') as f: res = json.load(f)
-        return res['errs']
+        errs = res['errs']
+        for i, ((src, lib), (_, wlib), e) in enumerate(zip(jobs, staged, errs)):
+            if e: continue
+            local = _mount(wlib)
+            if not os.path.exists(local):
+                errs[i] = 'Windows 侧没有产出 %s' % wlib; continue
+            try:
+                if os.path.realpath(local) != os.path.realpath(lib):
+                    shutil.copyfile(local, lib)
+            except OSError as ex:
+                errs[i] = str(ex)[:200]
+                continue
+            try: os.unlink(local)
+            except OSError: pass
+        return errs
     finally:
         for p in (mp, rp):
             try: os.unlink(p)
