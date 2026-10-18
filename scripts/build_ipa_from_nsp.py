@@ -304,7 +304,11 @@ def check_prereqs(env, xlate, profile):
         if not (os.environ.get('DM_IOS_SDK') or any(os.path.isdir(d) for d in (os.path.expanduser('~/ios-sdk'), '/opt/ios-sdk'))):
             gone.append('iPhoneOS SDK（设 DM_IOS_SDK，或放到 ~/ios-sdk/iPhoneOS26.5.sdk；公开仓库 xybp888/iOS-SDKs）')
         if profile == 'windows':
-            if not shutil.which('python.exe'): gone.append('Windows 侧的 python.exe（Metal 工具链是 Windows 程序，批量驱动在 Windows 侧跑；或用 DM_WIN_PYTHON 指定）')
+            # 用 metal_tool 自己的查找：shutil.which 在 WSL 里看不到 Windows 装的 Python
+            # Use metal_tool's own lookup: shutil.which does not see a Windows Python from WSL
+            import metal_tool as _mt
+            if not (_mt._find_windows_python() and _mt._find_windows_metal()):
+                gone.append('Windows 侧的 Metal 工具链（metal.exe 与 python.exe；可用 DM_METAL_EXE / DM_WIN_PYTHON 指定）')
     if gone: raise BuildError('找不到工具 | tools not found: ' + '，'.join(gone))
     if not xlate.exists() and not (xlate.parent / 'dmsh_xlate.dll').exists():
         raise BuildError(f'仓内没有着色器翻译器 | the shader translator is missing from the repository: {xlate}')

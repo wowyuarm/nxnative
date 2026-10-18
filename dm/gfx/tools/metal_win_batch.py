@@ -16,9 +16,15 @@ def one(metal, metallib, flags, work, i, src, lib):
     metal.exe 每个进程约 0.6 s 的启动开销，所以并行跑；实测 8 路把 968 ms/个 降到 182 ms/个。
     metal.exe costs about 0.6 s of startup per process, so run several at once: 8 workers measured 182 ms/job
     against 968 ms/job serial."""
-    local_src = os.path.join(work, '%d.metal' % i)
-    local_air = os.path.join(work, '%d.air' % i)
-    local_lib = os.path.join(work, '%d.metallib' % i)
+    # 中间产物放 work/tmp/，与作业目标（work/<i>.metallib）分开：否则 local_lib 就是目标本身，
+    # "编好了别删" 与 "别留着垃圾" 会打架
+    # Intermediates go in work/tmp/, separate from the job target (work/<i>.metallib): otherwise local_lib is the
+    # destination itself and "do not delete the output" fights "do not leave garbage"
+    tmpdir = os.path.join(work, 'tmp')
+    os.makedirs(tmpdir, exist_ok=True)
+    local_src = os.path.join(tmpdir, '%d.metal' % i)
+    local_air = os.path.join(tmpdir, '%d.air' % i)
+    local_lib = os.path.join(tmpdir, '%d.metallib' % i)
     same = False
     try:
         shutil.copyfile(src, local_src)
@@ -26,13 +32,12 @@ def one(metal, metallib, flags, work, i, src, lib):
         if r.returncode: return (r.stderr or r.stdout or 'metal -c failed').strip()[:200]
         r = subprocess.run([metallib, local_air, '-o', local_lib], capture_output=True, text=True)
         if r.returncode: return (r.stderr or r.stdout or 'metallib failed').strip()[:200]
-        same = os.path.realpath(local_lib) == os.path.realpath(lib)
-        if not same: shutil.copyfile(local_lib, lib)
+        shutil.copyfile(local_lib, lib)
         return None
     except OSError as e:
         return str(e)[:200]
     finally:
-        for p in (local_src, local_air) + (() if same else (local_lib,)):
+        for p in (local_src, local_air, local_lib):
             try: os.unlink(p)
             except OSError: pass
 

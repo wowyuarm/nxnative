@@ -94,9 +94,8 @@ def _win_tempdir():
     cands = []
     wt = os.environ.get('DM_WIN_TEMP')
     if wt: cands.append(_mount(wt) if not wt.startswith('/') else wt)
-    base = os.environ.get('WSL_APPDATA') or ''
-    for u in filter(None, (os.environ.get('WINUSER') or _win_user(), )):
-        cands += ['/mnt/c/Users/%s/AppData/Local/Temp/dmsh_metal' % u]
+    u = _win_user()
+    if u: cands.append('/mnt/c/Users/%s/AppData/Local/Temp/dmsh_metal' % u)
     cands += ['/mnt/c/Temp/dmsh_metal', '/mnt/d/Temp/dmsh_metal']
     for d in cands:
         try:
@@ -108,20 +107,22 @@ def _win_tempdir():
 
 
 def _win_user():
-    """Windows 用户名（/mnt/c/Users/<name>）。WSL 的 USER 与它可能不同。"""
+    """Windows 用户名：取 /mnt/c/Users 下真实存在的目录，不靠 %USERNAME%。
+    cmd.exe 经 WSL 互操作时拿到的可能是未展开的 \"(Current User Name)\"
+    The Windows user: a directory that actually exists under /mnt/c/Users rather than %USERNAME%, which comes back
+    unexpanded ("(Current User Name)") through WSL interop."""
     if 'winuser' in _cached: return _cached['winuser']
+    skip = ('All Users', 'Default', 'Default User', 'Public', 'desktop.ini', '(Current User Name)')
     name = None
     try:
-        r = subprocess.run(['cmd.exe', '/c', 'echo %USERNAME%'], capture_output=True, text=True, cwd='/mnt/c')
-        if r.returncode == 0 and r.stdout.strip(): name = r.stdout.strip()
+        cands = [e for e in os.listdir('/mnt/c/Users')
+                 if e not in skip and os.path.isdir(os.path.join('/mnt/c/Users', e))]
+        # 优先有 Windows Python 安装的那个：那是真正在用的账号（Default 之类是模板目录）
+        # Prefer the one with a Windows Python install: that is the account in use (Default and friends are templates)
+        withpy = [e for e in cands if os.path.isdir('/mnt/c/Users/%s/AppData/Local/Programs/Python' % e)]
+        name = (withpy or cands or [None])[0]
     except OSError:
-        pass
-    if not name:
-        try:
-            name = sorted(e for e in os.listdir('/mnt/c/Users')
-                          if os.path.isdir('/mnt/c/Users/' + e) and e not in ('All Users', 'Default', 'Default User', 'Public', 'desktop.ini'))[0]
-        except (OSError, IndexError):
-            name = None
+        name = None
     _cached['winuser'] = name
     return name
 
@@ -233,10 +234,16 @@ def _find_windows_python():
 
 def _win_flags(sdk, flags):
     """Windows 版 metal 不认 -sdk：换成 -target。iOS 的目标三元组与 Xcode 的 -sdk iphoneos 等价。
-    The Windows build has no -sdk: use -target. The iOS triple is what Xcode's -sdk iphoneos means."""
+    另外必须显式给 -std：Mac 版从 -sdk 推出语言标准，Windows 版不会，默认 macos-metal1.x，
+    而 spirv-cross 出的是 MSL 3.0（dmsh_build 的 --msl-version 20300），否则报
+    "'id' attribute requires Metal language standard macos-metal2.0 or higher"。
+    The Windows build has no -sdk: use -target. It also needs -std explicitly: the Mac build infers the language
+    standard from -sdk, the Windows build defaults to macos-metal1.x while spirv-cross emits MSL 3.0
+    (--msl-version 20300 in dmsh_build)."""
     tgt = {'iphoneos': 'air64-apple-ios', 'macosx': 'air64-apple-macos'}.get(sdk)
     out = list(flags)
     if tgt and not any(f.startswith('-target') for f in out): out += ['-target', tgt]
+    if not any(f.startswith('-std=') for f in out): out += ['-std=metal3.0']
     return out
 
 
@@ -253,9 +260,14 @@ def _compile_batch_windows(jobs, sdk, flags, log):
     # Outputs go to a Windows-local temp dir: metal.exe writes a .tmp and renames it, which fails over UNC
     # (invalid argument). Inputs can be read from UNC; outputs cannot be written there.
     wtmp = _win_tempdir()
+    # 作业目标放 out/，中间文件放 tmp/：同目录会让驱动分不清"要保留的产物"和"要删的中间物"
+    # Job targets go in out/, intermediates in tmp/: in one directory the driver cannot tell an output it must keep
+    # from an intermediate it must delete
+    wout = os.path.join(wtmp, 'out')
+    os.makedirs(wout, exist_ok=True)
     staged = []
     for i, (s, l) in enumerate(jobs):
-        staged.append((_win_path(s), _win_path(os.path.join(wtmp, '%d.metallib' % i))))
+        staged.append((_win_path(s), _win_path(os.path.join(wout, '%d.metallib' % i))))
     man = {'metal': _win_path(metal), 'sdk': sdk, 'flags': _win_flags(sdk, flags), 'jobs': [list(x) for x in staged],
            'work': _win_path(wtmp), 'workers': int(os.environ.get('J') or 8)}
     # 作业与结果文件也放在 Windows 本地目录：结果由 Windows 侧写回，写在 UNC 上会失败
